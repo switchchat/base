@@ -1,0 +1,25 @@
+{
+  "name": "evening wind-down",
+  "steps": [
+    {
+      "tool": "play_music",
+      "args": {
+        "song": "lo-fi chill beats"
+      }
+    },
+    {
+      "tool": "set_alarm",
+      "args": {
+        "hour": 7,
+        "minute": 0
+      }
+    },
+    {
+      "tool": "create_reminder",
+      "args": {
+        "title": "prepare lunch",
+        "time": "7:30 AM"
+      }
+    }
+  ]
+}

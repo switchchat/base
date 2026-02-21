@@ -132,6 +132,15 @@ def _coerce_argument_types(function_calls, tools):
                 pass
 
 
+def _is_valid_arg(val):
+    """Check if an argument value is present (handles 0 and False correctly)."""
+    if val is None:
+        return False
+    if isinstance(val, str) and val.strip() == "":
+        return False
+    return True
+
+
 def _filter_valid_calls(function_calls, tools):
     """Keep only calls that reference real tools with all required args non-empty."""
     tool_map = {t["name"]: t for t in tools}
@@ -142,16 +151,7 @@ def _filter_valid_calls(function_calls, tools):
             continue
         required = tool_map[name]["parameters"].get("required", [])
         args = call.get("arguments", {})
-        ok = True
-        for r in required:
-            if r not in args:
-                ok = False
-                break
-            val = args[r]
-            if val is None or (isinstance(val, str) and val.strip() == ""):
-                ok = False
-                break
-        if ok:
+        if all(r in args and _is_valid_arg(args[r]) for r in required):
             valid.append(call)
     return valid
 
@@ -279,16 +279,27 @@ def _identify_tool_from_text(text, tools):
 
 
 # ---------------------------------------------------------------------------
+# Proper noun extraction (reused across full query and split parts)
+# ---------------------------------------------------------------------------
+
+def _extract_proper_nouns(text, strip_set=None, schema_words=None):
+    """Extract capitalized words (proper nouns) from text, skipping index 0."""
+    nouns = []
+    words = text.split()
+    for i, w in enumerate(words):
+        cleaned = w.strip('.,!?;:\'"()[]{}')
+        if not cleaned or i == 0 or not cleaned[0].isupper():
+            continue
+        if cleaned.isdigit() or cleaned.upper() in ("AM", "PM"):
+            continue
+        if strip_set and schema_words and _should_strip(cleaned.lower(), strip_set, schema_words):
+            continue
+        nouns.append(cleaned)
+    return nouns
+
+
+# ---------------------------------------------------------------------------
 # Schema-driven argument extraction
-#
-# Priority order (resolves ambiguity when descriptions overlap):
-#   1. integer params  → numbers from text (including "8:15" → [8, 15])
-#   2. time params     → time expressions after "at" (digits + AM/PM)
-#   3. location params → text after "in"/"at" prepositions
-#   4. name params     → proper nouns (capitalized words not at start)
-#   5. content params  → text after "saying"/"that says"
-#   6. title params    → text after "about"/"to" (for tasks/reminders)
-#   7. remaining       → leftover text assigned to any unfilled params
 # ---------------------------------------------------------------------------
 
 def _build_strip_set(tool):
@@ -317,10 +328,13 @@ def _should_strip(word_lower, strip_set, schema_words):
     return False
 
 
-def _extract_from_schema(user_text, tool):
+def _extract_from_schema(user_text, tool, extra_nouns=None):
     """
     Extract arguments from the query using the tool's parameter schema.
-    Uses general English patterns (proper nouns, prepositions) — not tool-specific.
+    Uses general English patterns — not tool-specific.
+
+    extra_nouns: proper nouns from the parent query (for pronoun resolution
+                 in split sub-queries like "send him a message").
     """
     props = tool["parameters"]["properties"]
     required = tool["parameters"].get("required", [])
@@ -348,24 +362,24 @@ def _extract_from_schema(user_text, tool):
         args[pname] = abs(numbers[i]) if i < len(numbers) else 0
 
     # --- Phase 2: Extract proper nouns (capitalized words not at start) ---
-    proper_nouns = []
-    for i, w in enumerate(words):
-        cleaned = w.strip('.,!?;:\'"()[]{}')
-        if (cleaned and i > 0 and cleaned[0].isupper()
-                and not _should_strip(cleaned.lower(), strip_set, schema_words)
-                and not cleaned.isdigit()
-                and cleaned.upper() not in ("AM", "PM")):
-            proper_nouns.append(cleaned)
+    local_nouns = _extract_proper_nouns(user_text, strip_set, schema_words)
+    all_nouns = list(local_nouns)
+    if extra_nouns:
+        existing = {pn.lower() for pn in all_nouns}
+        for en in extra_nouns:
+            if en.lower() not in existing:
+                all_nouns.append(en)
 
     pn_used = set()
 
     # --- Phase 3: Extract string params by description category ---
     str_params = [(k, v) for k, v in props.items() if v.get("type") == "string"]
+    content_marker_pos = len(user_text)
 
     for pname, pschema in str_params:
         desc = (pschema.get("description", "") + " " + pname).lower()
 
-        # 3a. TIME params: extract "3:00 PM"-style expressions
+        # 3a. TIME params
         if any(kw in desc for kw in ["time", "when", "schedule"]):
             for prep in [" at "]:
                 idx = lower_text.find(prep)
@@ -382,7 +396,7 @@ def _extract_from_schema(user_text, tool):
                         args[pname] = " ".join(time_parts)
                         continue
 
-        # 3b. LOCATION params (checked BEFORE name to avoid "City name" ambiguity)
+        # 3b. LOCATION params (before name to avoid "City name" ambiguity)
         if any(kw in desc for kw in ["location", "city", "place"]):
             for prep in [" in ", " at "]:
                 idx = lower_text.find(prep)
@@ -400,8 +414,12 @@ def _extract_from_schema(user_text, tool):
                 continue
 
         # 3c. NAME/ENTITY params: use proper nouns
+        # Only use extra_nouns (cross-query context) for person-type params
+        # to avoid contaminating non-person params like "Song name".
         if any(kw in desc for kw in ["name", "person", "contact", "recipient", "query"]):
-            for pn in proper_nouns:
+            is_person = any(kw in desc for kw in ["person", "contact", "recipient"])
+            nouns_pool = all_nouns if is_person else local_nouns
+            for pn in nouns_pool:
                 if pn not in pn_used:
                     args[pname] = pn
                     pn_used.add(pn)
@@ -414,6 +432,7 @@ def _extract_from_schema(user_text, tool):
             for marker in [" saying ", " that says "]:
                 idx = lower_text.find(marker)
                 if idx >= 0:
+                    content_marker_pos = min(content_marker_pos, idx)
                     after = user_text[idx + len(marker):].strip()
                     for end_marker in [" and ", ", and "]:
                         end_idx = after.lower().find(end_marker)
@@ -447,8 +466,11 @@ def _extract_from_schema(user_text, tool):
                 continue
 
     # --- Phase 4: Fill remaining unfilled string params with leftover text ---
+    # Only use words BEFORE any content marker ("saying", "that says") to avoid
+    # leaking message content into other params like recipient.
+    text_for_remaining = user_text[:content_marker_pos]
     remaining = []
-    for w in words:
+    for w in text_for_remaining.split():
         cleaned = w.strip('.,!?;:\'"()[]{}').lower()
         if (cleaned
                 and not _should_strip(cleaned, strip_set, schema_words)
@@ -466,12 +488,32 @@ def _extract_from_schema(user_text, tool):
             args[pname] = remaining_text
             remaining_text = ""
 
-    if all(r in args and args[r] for r in required):
+    if all(r in args and _is_valid_arg(args[r]) for r in required):
         return {"name": tool["name"], "arguments": args}
     return None
 
 
-def _maybe_prefer_schema(calls, user_text, tools):
+def _best_extract_all_tools(user_text, tools, extra_nouns=None):
+    """
+    Try schema extraction for ALL available tools and pick the one whose
+    extracted arguments best match the query text (by overlap score).
+    """
+    best_call = None
+    best_score = 0
+    for t in tools:
+        ext = _extract_from_schema(user_text, t, extra_nouns=extra_nouns)
+        if ext:
+            _coerce_argument_types([ext], [t])
+            valid = _filter_valid_calls([ext], [t])
+            if valid:
+                score = _arg_query_overlap(valid, user_text)
+                if score > best_score:
+                    best_score = score
+                    best_call = valid[0]
+    return best_call, best_score
+
+
+def _maybe_prefer_schema(calls, user_text, tools, extra_nouns=None):
     """
     For each model-returned call, also run schema extraction for the SAME tool
     and pick whichever has better argument-query overlap. Zero-cost (no model call).
@@ -482,7 +524,7 @@ def _maybe_prefer_schema(calls, user_text, tools):
         if not tool:
             improved.append(call)
             continue
-        schema_alt = _extract_from_schema(user_text, tool)
+        schema_alt = _extract_from_schema(user_text, tool, extra_nouns=extra_nouns)
         if schema_alt:
             _coerce_argument_types([schema_alt], [tool])
             alt_valid = _filter_valid_calls([schema_alt], [tool])
@@ -531,7 +573,7 @@ def _get_ms(raw):
 # Generators
 # ---------------------------------------------------------------------------
 
-def generate_cactus(messages, tools):
+def generate_cactus(messages, tools, extra_nouns=None):
     """
     On-device function calling with multi-strategy fallback:
 
@@ -539,8 +581,8 @@ def generate_cactus(messages, tools):
        → Compare model's args against schema extract; pick the better match.
     2. Schema-guided single-tool retry — if the model picked the wrong tool
        or failed entirely, retry with only the schema-selected tool.
-    3. Schema-driven extraction — construct a function call from the query
-       using tool parameter descriptions.
+    3. Schema-driven extraction — try target tool first; fall back to all-tools
+       only when the target was unreliably identified.
     """
     model = _get_cactus_model()
     cactus_tools = [{"type": "function", "function": t} for t in tools]
@@ -581,7 +623,7 @@ def generate_cactus(messages, tools):
                 _diag(f"schema OVERRIDE: model={calls1[0]['name']} schema={schema_tool['name']} (m_rel={m_rel:.2f} s_rel={s_rel:.2f})")
 
     if calls1 and not skip_model_calls:
-        calls1 = _maybe_prefer_schema(calls1, user_text, tools)
+        calls1 = _maybe_prefer_schema(calls1, user_text, tools, extra_nouns=extra_nouns)
         return {
             "function_calls": calls1,
             "total_time_ms": total_ms,
@@ -591,12 +633,14 @@ def generate_cactus(messages, tools):
 
     # ---- Find the best target tool for retry ----
     target = _find_best_tool(user_text, tools)
+    target_reliable = target is not None
     if not target:
         model_text = (raw1 or {}).get("response", "") or ""
         target = _identify_tool_from_text(model_text, tools)
     if not target and len(tools) == 1:
         target = tools[0]
-    _diag(f"target tool for retry: {target['name'] if target else 'NONE'}")
+        target_reliable = True
+    _diag(f"target tool for retry: {target['name'] if target else 'NONE'} (reliable={target_reliable})")
 
     # ---- Attempt 2: Single-tool retry (schema-guided) ----
     if target:
@@ -610,7 +654,7 @@ def generate_cactus(messages, tools):
             _coerce_argument_types(fc, [target])
             calls2 = _filter_valid_calls(fc, [target])
             if calls2:
-                calls2 = _maybe_prefer_schema(calls2, user_text, [target])
+                calls2 = _maybe_prefer_schema(calls2, user_text, [target], extra_nouns=extra_nouns)
                 _diag(f"attempt2 OK: {json.dumps(calls2, ensure_ascii=False)}")
                 return {
                     "function_calls": calls2,
@@ -622,21 +666,63 @@ def generate_cactus(messages, tools):
         resp2 = (raw2 or {}).get("response", "")
         _diag(f"attempt2 FAIL: response={resp2!r:.120}")
 
-    # ---- Attempt 3: Schema-driven extraction from query text ----
+    # ---- Attempt 3: Schema-driven extraction ----
+    # 3a: Try the identified target tool first
+    target_call = None
     if target:
-        extracted = _extract_from_schema(user_text, target)
-        if extracted:
-            _coerce_argument_types([extracted], [target])
-            valid = _filter_valid_calls([extracted], [target])
+        ext = _extract_from_schema(user_text, target, extra_nouns=extra_nouns)
+        if ext:
+            _coerce_argument_types([ext], [target])
+            valid = _filter_valid_calls([ext], [target])
             if valid:
-                _diag(f"attempt3 (schema-extract) OK: {json.dumps(valid, ensure_ascii=False)}")
-                return {
-                    "function_calls": valid,
-                    "total_time_ms": total_ms,
-                    "confidence": 0.5,
-                    "cloud_handoff": False,
-                }
-        _diag("attempt3 (schema-extract) FAIL")
+                target_call = valid[0]
+
+    # 3b: If target is reliable, trust it
+    if target_call and target_reliable:
+        _diag(f"attempt3 (target extract) OK: {json.dumps([target_call], ensure_ascii=False)}")
+        return {
+            "function_calls": [target_call],
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+
+    # 3c: Target unreliable or failed — try all tools and compare
+    best_all, best_all_score = _best_extract_all_tools(user_text, tools, extra_nouns=extra_nouns)
+    if target_call and best_all:
+        target_score = _arg_query_overlap([target_call], user_text)
+        if best_all_score > target_score:
+            _diag(f"attempt3 (all-tools) OK: {json.dumps([best_all], ensure_ascii=False)} score={best_all_score} > target={target_score}")
+            return {
+                "function_calls": [best_all],
+                "total_time_ms": total_ms,
+                "confidence": 0.5,
+                "cloud_handoff": False,
+            }
+        _diag(f"attempt3 (target wins) OK: {json.dumps([target_call], ensure_ascii=False)} score={target_score}")
+        return {
+            "function_calls": [target_call],
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    if best_all and best_all_score > 0:
+        _diag(f"attempt3 (all-tools) OK: {json.dumps([best_all], ensure_ascii=False)} score={best_all_score}")
+        return {
+            "function_calls": [best_all],
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    if target_call:
+        _diag(f"attempt3 (target extract) OK: {json.dumps([target_call], ensure_ascii=False)}")
+        return {
+            "function_calls": [target_call],
+            "total_time_ms": total_ms,
+            "confidence": 0.5,
+            "cloud_handoff": False,
+        }
+    _diag("attempt3 FAIL")
 
     _diag("ALL LOCAL ATTEMPTS FAILED")
     return {
@@ -705,6 +791,8 @@ def generate_hybrid(messages, tools):
         2. If the query has multiple intents (conjunctions) and the model
            returned fewer calls than expected, split and run each part
            through the full local pipeline, then MERGE results.
+           Proper nouns from the full query are forwarded to split parts
+           for pronoun resolution (e.g. "him" → "Tom").
         3. Cloud fallback only when all local attempts produce nothing.
     """
     user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
@@ -720,11 +808,15 @@ def generate_hybrid(messages, tools):
     total_ms = local["total_time_ms"]
 
     if len(parts) > 1 and len(model_calls) < expected_count:
-        _diag(f"SPLIT: {len(parts)} parts, model has {len(model_calls)}/{expected_count} calls")
+        full_nouns = _extract_proper_nouns(user_text)
+        _diag(f"SPLIT: {len(parts)} parts, model has {len(model_calls)}/{expected_count} calls, context_nouns={full_nouns}")
         split_calls = []
         for part in parts:
             _diag(f"  split part: {part!r}")
-            sub = generate_cactus([{"role": "user", "content": part}], tools)
+            sub = generate_cactus(
+                [{"role": "user", "content": part}], tools,
+                extra_nouns=full_nouns,
+            )
             sub_calls = _filter_valid_calls(sub["function_calls"], tools)
             split_calls.extend(sub_calls)
             total_ms += sub["total_time_ms"]
