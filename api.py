@@ -76,6 +76,14 @@ class Api:
 
         audio_data = np.concatenate(self._recorded_frames, axis=0)
 
+        # Audio diagnostics
+        duration_s = len(audio_data) / SAMPLE_RATE
+        rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
+        print(f"[audio] duration={duration_s:.1f}s, rms={rms:.0f}, frames={len(self._recorded_frames)}")
+
+        if duration_s < 0.5:
+            return {"error": "Recording too short", "text": "", "time_ms": 0}
+
         # Write WAV to temp file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -94,7 +102,16 @@ class Api:
             elapsed = (time.time() - start) * 1000
             parsed = json.loads(raw) if isinstance(raw, str) else raw
             text = parsed.get("response", "") if isinstance(parsed, dict) else str(parsed)
-            result = {"text": text.strip(), "time_ms": round(elapsed, 1)}
+            text = text.strip()
+            print(f"[audio] transcription: {text!r}")
+
+            # Filter out Whisper hallucinations
+            hallucinations = {"[blank_audio]", "[blank audio]", "(blank audio)", "you",
+                              "thank you", "thanks", "bye", "okay", ""}
+            if text.lower().strip(".,!? ") in hallucinations:
+                return {"error": "No speech detected", "text": "", "time_ms": round(elapsed, 1)}
+
+            result = {"text": text, "time_ms": round(elapsed, 1)}
         except Exception as e:
             result = {"error": str(e), "text": "", "time_ms": 0}
         finally:
@@ -132,20 +149,69 @@ class Api:
 
         text = text.strip()
 
-        # Check for routine creation: "create routine called X: steps..."
-        # Colon is the delimiter between name and steps
+        # Check for routine creation
+        create_match = None
+        routine_name = None
+        steps_text = None
+
+        # Pattern 1: "create routine called X: steps..."
         create_match = re.match(
             r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:called|named)\s+(.+?)\s*:\s*(.+)",
             text, re.IGNORECASE
         )
-        if not create_match:
-            # Also handle "create routine called X to/that does ..."
+        if create_match:
+            routine_name = create_match.group(1).strip()
+            steps_text = create_match.group(2).strip()
+
+        # Pattern 2: "create routine called X to/that/which steps..."
+        if not routine_name:
             create_match = re.match(
                 r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:called|named)\s+(.+?)\s+(?:to|that|which|with)\s+(.+)",
                 text, re.IGNORECASE
             )
-        if create_match:
-            return self._create_routine(create_match.group(1).strip(), create_match.group(2).strip())
+            if create_match:
+                routine_name = create_match.group(1).strip()
+                steps_text = create_match.group(2).strip()
+
+        # Pattern 3: "create a X routine, step1, step2..."  or  "create a X routine to step1 and step2"
+        _ARTICLES = {"a", "an", "the", "my"}
+        if not routine_name:
+            create_match = re.match(
+                r"(?:create|make|add|set up|build)\s+(?:a\s+)?(.+?)\s+routine\s*[,:]\s*(.+)",
+                text, re.IGNORECASE
+            )
+            if create_match and create_match.group(1).strip().lower() not in _ARTICLES:
+                routine_name = create_match.group(1).strip()
+                steps_text = create_match.group(2).strip()
+
+        if not routine_name:
+            create_match = re.match(
+                r"(?:create|make|add|set up|build)\s+(?:a\s+)?(.+?)\s+routine\s+(?:to|that|which|with)\s+(.+)",
+                text, re.IGNORECASE
+            )
+            if create_match and create_match.group(1).strip().lower() not in _ARTICLES:
+                routine_name = create_match.group(1).strip()
+                steps_text = create_match.group(2).strip()
+
+        # Pattern 4: "create a routine, steps" or "create a routine to steps" (auto-name)
+        if not routine_name:
+            # Try comma/colon/period delimiter
+            create_match = re.match(
+                r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s*[,:.]\s*(.+)",
+                text, re.IGNORECASE
+            )
+            if not create_match:
+                # Try conjunction word delimiter
+                create_match = re.match(
+                    r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:to|that|which|with)\s+(.+)",
+                    text, re.IGNORECASE
+                )
+            if create_match:
+                routine_name = "my routine"
+                steps_text = create_match.group(1).strip()
+
+        if routine_name and steps_text:
+            return self._create_routine(routine_name, steps_text)
 
         # Check for routine execution: "run/execute/start X"
         run_match = re.match(
@@ -161,18 +227,21 @@ class Api:
         return self._direct_command(text)
 
     def _create_routine(self, name, steps_text):
-        # Split steps description by commas / "and" / "then"
-        parts = re.split(r',\s*(?:and\s+)?|,?\s+and\s+|,?\s+then\s+', steps_text)
-        parts = [p.strip() for p in parts if len(p.strip()) > 3]
+        # Use cloud (Gemini) for the full steps text — it handles multi-tool
+        # intent parsing much better than the local 270M model
+        from main import generate_cloud
+        print(f"[routine] Creating routine '{name}' from: {steps_text!r}")
+        messages = [{"role": "user", "content": steps_text}]
+        try:
+            result = generate_cloud(messages, ACTION_TOOLS)
+            print(f"[routine] Cloud result: {result}")
+        except Exception as e:
+            print(f"[routine] Cloud error: {e}")
+            return {"type": "error", "message": f"Cloud API error: {e}"}
 
         steps = []
-        for part in parts:
-            messages = [{"role": "user", "content": part}]
-            with self._lock:
-                result = generate_hybrid(messages, ACTION_TOOLS)
-
-            for call in result.get("function_calls", []):
-                steps.append({"tool": call["name"], "args": call.get("arguments", {})})
+        for call in result.get("function_calls", []):
+            steps.append({"tool": call["name"], "args": call.get("arguments", {})})
 
         if not steps:
             return {"type": "error", "message": "Could not parse any steps from your description"}

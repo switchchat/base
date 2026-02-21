@@ -67,7 +67,7 @@ ACTION_TOOLS = [
                 "title": {"type": "string", "description": "Reminder title"},
                 "time": {"type": "string", "description": "Time for the reminder (e.g. 3:00 PM)"},
             },
-            "required": ["title", "time"],
+            "required": ["title"],
         },
     },
     {

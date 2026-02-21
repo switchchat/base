@@ -363,6 +363,19 @@ body {
     color: var(--text-dim);
 }
 
+.flow-node-condition {
+    font-size: 10px;
+    font-weight: 600;
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.25);
+    border-radius: 4px;
+    padding: 2px 8px;
+    margin-bottom: 6px;
+    display: inline-block;
+    letter-spacing: 0.3px;
+}
+
 .flow-node-args {
     font-size: 11px;
     color: var(--text-secondary);

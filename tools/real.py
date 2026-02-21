@@ -14,25 +14,29 @@ import urllib.request
 # Weather — real data via wttr.in (free, no API key)
 # =====================================================================
 def get_weather(location):
-    try:
-        url = "https://wttr.in/{}?format=j1".format(location.replace(" ", "+"))
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        c = data["current_condition"][0]
-        temp_f = c["temp_F"]
-        desc = c["weatherDesc"][0]["value"]
-        return {
-            "location": location,
-            "temperature": "{}°F".format(temp_f),
-            "feels_like": "{}°F".format(c.get("FeelsLikeF", temp_f)),
-            "condition": desc,
-            "humidity": "{}%".format(c["humidity"]),
-            "wind": "{} mph".format(c["windspeedMiles"]),
-            "summary": "{}, {}°F in {}".format(desc, temp_f, location),
-        }
-    except Exception as e:
-        return {"error": str(e), "summary": "Could not fetch weather for {}".format(location)}
+    url = "https://wttr.in/{}?format=j1".format(location.replace(" ", "+"))
+    last_err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            c = data["current_condition"][0]
+            temp_f = c["temp_F"]
+            desc = c["weatherDesc"][0]["value"]
+            return {
+                "location": location,
+                "temperature": "{}°F".format(temp_f),
+                "feels_like": "{}°F".format(c.get("FeelsLikeF", temp_f)),
+                "condition": desc,
+                "humidity": "{}%".format(c["humidity"]),
+                "wind": "{} mph".format(c["windspeedMiles"]),
+                "summary": "{}, {}°F in {}".format(desc, temp_f, location),
+            }
+        except Exception as e:
+            last_err = e
+            _time.sleep(0.5)
+    return {"error": str(last_err), "summary": "Could not fetch weather for {}".format(location)}
 
 
 # =====================================================================
@@ -40,7 +44,7 @@ def get_weather(location):
 # =====================================================================
 def play_music(song):
     try:
-        # Try Spotify first (most people have it)
+        # Check which music apps are running
         result = subprocess.run(
             ["osascript", "-e", 'tell application "System Events" to get name of every process'],
             capture_output=True, text=True, timeout=3,
@@ -48,27 +52,61 @@ def play_music(song):
         apps = result.stdout.lower()
 
         if "spotify" in apps:
-            subprocess.Popen([
+            subprocess.Popen(["open", "spotify:search:%s" % song])
+            _time.sleep(1.5)
+            subprocess.run([
                 "osascript", "-e",
                 'tell application "Spotify"\n'
                 '  activate\n'
+                '  play\n'
+                'end tell',
+            ], timeout=3)
+            return {"status": "playing", "app": "Spotify", "query": song,
+                    "summary": 'Playing "%s" on Spotify' % song}
+
+        # Apple Music: try multiple search terms for better matching
+        search_terms = [song]
+        words = song.split()
+        if len(words) > 1:
+            search_terms.append(words[0])
+            search_terms.append(" ".join(words[1:]))
+
+        for term in search_terms:
+            safe_term = term.replace('"', '\\"')
+            search_script = '\n'.join([
+                'tell application "Music"',
+                '  activate',
+                '  delay 0.5',
+                '  set searchResults to search playlist "Library" for "%s" only songs' % safe_term,
+                '  if (count of searchResults) > 0 then',
+                '    play item 1 of searchResults',
+                '    set trackName to name of item 1 of searchResults',
+                '    set artistName to artist of item 1 of searchResults',
+                '    return trackName & " by " & artistName',
+                '  else',
+                '    return "NOT_FOUND"',
+                '  end if',
                 'end tell',
             ])
-            subprocess.Popen(["open", "spotify:search:{}".format(song)])
-            return {"status": "playing", "app": "Spotify", "query": song,
-                    "summary": "Searching \"{}\" on Spotify".format(song)}
+            result = subprocess.run(
+                ["osascript", "-e", search_script],
+                capture_output=True, text=True, timeout=15,
+            )
+            output = result.stdout.strip()
+            if result.stderr.strip():
+                print("[play_music] stderr for '%s': %s" % (term, result.stderr.strip()))
 
-        # Fall back to Apple Music
-        subprocess.Popen([
-            "osascript", "-e",
-            'tell application "Music"\n'
-            '  activate\n'
-            'end tell',
-        ])
-        subprocess.Popen(["open", "https://music.apple.com/us/search?term={}".format(
-            song.replace(" ", "+"))])
-        return {"status": "playing", "app": "Apple Music", "query": song,
-                "summary": "Searching \"{}\" on Apple Music".format(song)}
+            if output and output != "NOT_FOUND":
+                return {"status": "playing", "app": "Apple Music", "query": song,
+                        "now_playing": output,
+                        "summary": "Now playing %s on Apple Music" % output}
+
+        # Nothing found in library
+        subprocess.Popen(["open", "https://music.apple.com/us/search?term=%s" %
+            song.replace(" ", "+")])
+        return {"status": "searching", "app": "Apple Music", "query": song,
+                "summary": 'Searching "%s" on Apple Music (not in library)' % song}
+
     except Exception as e:
         return {"error": str(e), "summary": "Could not play music"}
 
@@ -143,7 +181,7 @@ def set_alarm(hour, minute):
 # =====================================================================
 # Reminder — adds to Apple Reminders app
 # =====================================================================
-def create_reminder(title, time_str):
+def create_reminder(title, time="later"):
     try:
         script = (
             'tell application "Reminders"\n'
@@ -152,7 +190,7 @@ def create_reminder(title, time_str):
             '{{name:"{} at {}"}}\n'
             '  end tell\n'
             'end tell'
-        ).format(title.replace('"', '\\"'), time_str.replace('"', '\\"'))
+        ).format(title.replace('"', '\\"'), time.replace('"', '\\"'))
         subprocess.run(["osascript", "-e", script], timeout=5,
                        capture_output=True, text=True)
 
@@ -160,11 +198,11 @@ def create_reminder(title, time_str):
             "osascript", "-e",
             'display notification "{} at {}" '
             'with title "Reminder Created"'.format(
-                title.replace('"', '\\"'), time_str.replace('"', '\\"')),
+                title.replace('"', '\\"'), time.replace('"', '\\"')),
         ])
 
-        return {"status": "created", "title": title, "time": time_str,
-                "summary": "Reminder added: {} at {}".format(title, time_str)}
+        return {"status": "created", "title": title, "time": time,
+                "summary": "Reminder added: {} at {}".format(title, time)}
     except Exception as e:
         return {"error": str(e),
                 "summary": "Could not create reminder"}

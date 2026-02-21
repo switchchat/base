@@ -249,6 +249,7 @@ function renderFlow(routine) {
                     <div class="flow-node-step">Step ${i + 1}</div>
                 </div>
             </div>
+            ${step.condition ? `<div class="flow-node-condition">◆ ${escapeHtml(step.condition)}</div>` : ''}
             <div class="flow-node-args">${argsHtml}</div>
             <div class="flow-node-result" id="result-${i}"></div>
         `;
