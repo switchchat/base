@@ -3,7 +3,7 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
+import json, os, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
@@ -72,7 +72,7 @@ def generate_cloud(messages, tools):
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash-lite",
         contents=contents,
         config=types.GenerateContentConfig(tools=gemini_tools),
     )
@@ -94,11 +94,59 @@ def generate_cloud(messages, tools):
     }
 
 
+# Action patterns — each pattern corresponds to a distinct tool capability.
+# If 2+ patterns match the user message, the query likely requires multiple function calls.
+_ACTION_PATTERNS = [
+    r'\bsend\b|\btext\b',                                          # send_message
+    r'\bset\s+an?\s+alarm\b|\bwake\s+me\s+up\b|\balarm\s+for\b',  # set_alarm
+    r'\bset\s+a\s+timer\b|\btimer\s+for\b',                        # set_timer
+    r'\bplay\b',                                                    # play_music
+    r'\bweather\b',                                                 # get_weather
+    r'\bremind\b|\breminder\b',                                     # create_reminder
+    r'\bfind\b|\blook\s+up\b|\bcontacts\b',                        # search_contacts
+]
+
+
+def _needs_multiple_calls(messages):
+    """Return True if the prompt likely requires 2+ tool calls."""
+    user_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+    matched = sum(1 for p in _ACTION_PATTERNS if re.search(p, user_msg, re.I))
+    return matched >= 2
+
+
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
+    """
+    Smart hybrid routing strategy:
+    - Multi-action queries (2+ distinct tool intents detected) → route directly to cloud.
+      FunctionGemma 270M reliably produces only one function call, so skipping local
+      inference avoids wasted latency and low F1 on hard multi-call cases.
+    - Single-action queries → try local first with a lenient confidence threshold.
+      More tools available = stricter threshold (harder selection problem).
+      Fall back to cloud only when local confidence is too low.
+    """
+    # Pre-route multi-action requests directly to cloud (skip local entirely).
+    if _needs_multiple_calls(messages):
+        try:
+            cloud = generate_cloud(messages, tools)
+            cloud["source"] = "cloud (multi-action)"
+            return cloud
+        except Exception as e:
+            print(f"Cloud call failed: {e}")
+            # Fall through to local as last resort
+
+    # Single-action: attempt local inference first.
     local = generate_cactus(messages, tools)
 
-    if local["confidence"] >= confidence_threshold:
+    # Adaptive threshold: more tools = harder tool-selection = require higher confidence.
+    # confidence_threshold is honored as the ceiling for the hardest single-action cases.
+    if len(tools) == 1:
+        threshold = 0.5               # easy: one option, model just needs to fill args
+    elif len(tools) <= 3:
+        threshold = 0.7               # medium: small selection
+    else:
+        threshold = confidence_threshold  # large selection — use caller's threshold
+
+    if local["confidence"] >= threshold:
         local["source"] = "on-device"
         return local
 
