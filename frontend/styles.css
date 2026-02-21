@@ -378,6 +378,43 @@ body {
     color: var(--text);
 }
 
+/* Node result (shown after execution) */
+.flow-node-result {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    line-height: 1.4;
+    min-height: 0;
+}
+
+.flow-node-result:empty {
+    display: none;
+}
+
+.flow-node.success .flow-node-result {
+    color: var(--green);
+}
+
+.flow-node.error .flow-node-result {
+    color: var(--accent);
+}
+
+.flow-node.running .flow-node-result {
+    color: var(--blue);
+}
+
+.node-result-text {
+    font-family: var(--font);
+}
+
+.node-time {
+    font-family: var(--mono);
+    color: var(--text-dim);
+    font-size: 10px;
+}
+
 .flow-connector {
     width: 40px;
     height: 2px;
@@ -508,8 +545,41 @@ body {
     margin-right: 6px;
 }
 
-.chat-msg.error-msg .chat-prefix {
+.chat-msg.error-msg .chat-prefix,
+.chat-error-prefix {
     color: var(--accent);
+    font-weight: 600;
+    margin-right: 6px;
+}
+
+.chat-sys-prefix {
+    color: var(--text-dim);
+    margin-right: 6px;
+}
+
+.chat-sys-text {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
+/* Result messages in chat */
+.chat-msg.result {
+    background: var(--bg-surface);
+    border-radius: 6px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.chat-tool-icon {
+    font-size: 16px;
+    flex-shrink: 0;
+}
+
+.chat-result-text {
+    color: var(--text);
+    flex: 1;
 }
 
 .chat-msg .chat-time {

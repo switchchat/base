@@ -132,11 +132,18 @@ class Api:
 
         text = text.strip()
 
-        # Check for routine creation: "create/make routine called X: steps..."
+        # Check for routine creation: "create routine called X: steps..."
+        # Colon is the delimiter between name and steps
         create_match = re.match(
-            r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:called|named)\s+(.+?)[\s:]+(.+)",
+            r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:called|named)\s+(.+?)\s*:\s*(.+)",
             text, re.IGNORECASE
         )
+        if not create_match:
+            # Also handle "create routine called X to/that does ..."
+            create_match = re.match(
+                r"(?:create|make|add|set up|build)\s+(?:a\s+)?routine\s+(?:called|named)\s+(.+?)\s+(?:to|that|which|with)\s+(.+)",
+                text, re.IGNORECASE
+            )
         if create_match:
             return self._create_routine(create_match.group(1).strip(), create_match.group(2).strip())
 
@@ -232,6 +239,17 @@ class Api:
             "inference_ms": round(inference_ms, 1),
             "source": result.get("source", "on-device"),
         }
+
+    # ------------------------------------------------------------------
+    # Direct routine execution (called by Run button, bypasses text parser)
+    # ------------------------------------------------------------------
+    def run_routine(self, name):
+        routine = self._engine.get(name)
+        if not routine:
+            name = self._engine.fuzzy_match(name)
+            if not name:
+                return {"type": "error", "message": f"Routine not found"}
+        return self._execute_routine(name)
 
     # ------------------------------------------------------------------
     # Routine CRUD for frontend

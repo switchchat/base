@@ -1,4 +1,4 @@
-from tools import simulated
+from tools import real
 
 ACTION_TOOLS = [
     {
@@ -84,18 +84,18 @@ ACTION_TOOLS = [
 ]
 
 _DISPATCH = {
-    "get_weather": simulated.get_weather,
-    "send_message": simulated.send_message,
-    "set_alarm": simulated.set_alarm,
-    "set_timer": simulated.set_timer,
-    "play_music": simulated.play_music,
-    "create_reminder": simulated.create_reminder,
-    "search_contacts": simulated.search_contacts,
+    "get_weather": real.get_weather,
+    "send_message": real.send_message,
+    "set_alarm": real.set_alarm,
+    "set_timer": real.set_timer,
+    "play_music": real.play_music,
+    "create_reminder": real.create_reminder,
+    "search_contacts": real.search_contacts,
 }
 
 
 def execute_tool(name, args):
     fn = _DISPATCH.get(name)
     if not fn:
-        return {"error": f"Unknown tool: {name}"}
+        return {"error": "Unknown tool: {}".format(name)}
     return fn(**args)
