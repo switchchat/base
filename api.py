@@ -187,7 +187,23 @@ class Api:
         result = self._engine.execute(name, execute_tool, progress_callback=progress)
         return {"type": "routine_executed", "result": result}
 
+    @staticmethod
+    def _is_actionable(text):
+        """Reject very short or clearly non-command inputs."""
+        words = [w for w in text.lower().split() if len(w) >= 2]
+        if len(words) < 2:
+            return False
+        action_keywords = {
+            "weather", "alarm", "timer", "play", "music", "send", "message",
+            "remind", "reminder", "search", "contact", "call", "set", "get",
+            "check", "find", "tell", "text", "whats", "what's",
+        }
+        return bool(set(words) & action_keywords)
+
     def _direct_command(self, text):
+        if not self._is_actionable(text):
+            return {"type": "no_action", "message": f"I didn't recognize a command in \"{text}\". Try something like \"What's the weather in Tokyo\" or \"Set a timer for 5 minutes\"."}
+
         messages = [{"role": "user", "content": text}]
         start = time.time()
         with self._lock:

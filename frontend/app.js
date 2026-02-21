@@ -1,278 +1,320 @@
 // ============================================================
-// Voice Routines — Frontend App
+// Voice Routines — Frontend
 // ============================================================
 
 let isRecording = false;
+let activeRoutine = null;
 
 // ---- DOM refs ----
 const micBtn = document.getElementById('mic-btn');
-const micLabel = document.getElementById('mic-label');
-const waveformCanvas = document.getElementById('waveform');
-const execLog = document.getElementById('execution-log');
-const routineList = document.getElementById('routine-list');
-const timingDisplay = document.getElementById('timing-display');
 const textInput = document.getElementById('text-input');
 const sendBtn = document.getElementById('send-btn');
+const routineList = document.getElementById('routine-list');
+const flowContainer = document.getElementById('flow-container');
+const canvasEmpty = document.getElementById('canvas-empty');
+const chatMessages = document.getElementById('chat-messages');
+const bottomLogs = document.getElementById('bottom-logs');
+const timingDisplay = document.getElementById('timing-display');
+const canvasView = document.getElementById('canvas-view');
+const logsView = document.getElementById('logs-view');
+const execLog = document.getElementById('execution-log');
+
+// Tool icons
+const TOOL_ICONS = {
+    get_weather: { icon: '\u2601', cls: 'weather' },
+    play_music: { icon: '\u266B', cls: 'music' },
+    set_timer: { icon: '\u23F1', cls: 'timer' },
+    set_alarm: { icon: '\u23F0', cls: 'alarm' },
+    send_message: { icon: '\u2709', cls: 'message' },
+    create_reminder: { icon: '\uD83D\uDD14', cls: 'reminder' },
+    search_contacts: { icon: '\uD83D\uDC64', cls: 'contact' },
+};
+
+function getToolVisual(toolName) {
+    return TOOL_ICONS[toolName] || { icon: '\u2699', cls: 'default' };
+}
+
+function now() {
+    const d = new Date();
+    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
 // ============================================================
-// Audio Recording (Python-side via sounddevice)
+// Tab switching
 // ============================================================
+document.querySelectorAll('.nav-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const view = tab.dataset.view;
+        canvasView.classList.toggle('hidden', view !== 'canvas');
+        logsView.classList.toggle('hidden', view !== 'logs');
+    });
+});
 
+// ============================================================
+// Audio Recording (Python-side)
+// ============================================================
 async function startRecording() {
     const res = await pywebview.api.start_recording();
-    if (res.status === 'already_recording') return;
     if (res.error) {
         showToast('Mic error: ' + res.error, 'error');
         return;
     }
     isRecording = true;
     micBtn.classList.add('recording');
-    micLabel.textContent = 'Recording... click to stop';
 }
 
 async function stopRecording() {
     isRecording = false;
     micBtn.classList.remove('recording');
-    micLabel.textContent = 'Transcribing...';
+    addChatMsg('system', 'Transcribing...');
 
     const totalStart = performance.now();
     const txResult = await pywebview.api.stop_recording();
 
     if (txResult.error) {
-        showToast('Transcription error: ' + txResult.error, 'error');
-        micLabel.textContent = 'Click to record';
+        addChatMsg('error', 'Transcription error: ' + txResult.error);
+        return;
+    }
+    if (!txResult.text) {
+        addChatMsg('error', 'No speech detected');
         return;
     }
 
-    const text = txResult.text;
-    if (!text) {
-        showToast('No speech detected', 'error');
-        micLabel.textContent = 'Click to record';
-        return;
-    }
+    addChatMsg('user', txResult.text, txResult.time_ms);
+    addChatMsg('system', 'Processing...');
 
-    addTranscript(text, txResult.time_ms);
-    micLabel.textContent = 'Executing...';
-
-    const cmdResult = await pywebview.api.process_command(text);
+    const cmdResult = await pywebview.api.process_command(txResult.text);
     const totalMs = performance.now() - totalStart;
-
     handleResult(cmdResult, txResult.time_ms, totalMs);
-    micLabel.textContent = 'Click to record';
 }
 
 // ============================================================
 // Command Flow
 // ============================================================
-
 async function processTextCommand(text) {
     if (!text.trim()) return;
-    addTranscript(text, 0);
-    micLabel.textContent = 'Processing...';
+    addChatMsg('user', text);
+    addChatMsg('system', 'Processing...');
 
     const totalStart = performance.now();
     const cmdResult = await pywebview.api.process_command(text);
     const totalMs = performance.now() - totalStart;
-
     handleResult(cmdResult, 0, totalMs);
-    micLabel.textContent = 'Click to record';
 }
 
 function handleResult(result, transcribeMs, totalMs) {
+    // Remove "Processing..." message
+    const msgs = chatMessages.querySelectorAll('.chat-msg.system');
+    const last = msgs[msgs.length - 1];
+    if (last && last.textContent.includes('Processing')) last.remove();
+
     if (result.type === 'direct') {
         for (const r of result.results) {
-            addLogEntry(r.tool, r.args, r.result, 'success', r.time_ms);
+            addChatMsg('system', `${r.tool}(${formatArgs(r.args)})`, r.time_ms);
+            addLogLine('success', r.tool, formatArgs(r.args));
         }
         showTiming(transcribeMs, result.inference_ms, totalMs);
         showToast('Command executed', 'success');
 
     } else if (result.type === 'routine_created') {
-        addRoutineHeader('Created: ' + result.routine.name);
-        for (let i = 0; i < result.routine.steps.length; i++) {
-            const s = result.routine.steps[i];
-            addLogEntry(s.tool, s.args, null, 'success', 0);
-        }
+        addChatMsg('system', result.message);
+        addLogLine('success', 'routine_created', result.routine.name);
         showToast(result.message, 'success');
         loadRoutines();
 
     } else if (result.type === 'routine_executed') {
         if (result.result && result.result.results) {
-            let allSuccess = true;
-            for (const r of result.result.results) {
-                if (r.status !== 'success') allSuccess = false;
-            }
-            showToast(
-                `Routine "${result.result.routine}" ${allSuccess ? 'completed' : 'finished with errors'}`,
-                allSuccess ? 'success' : 'error'
-            );
+            const allOk = result.result.results.every(r => r.status === 'success');
+            addChatMsg('system', `Routine "${result.result.routine}" ${allOk ? 'completed' : 'finished with errors'}`);
+            showToast(`Routine ${allOk ? 'completed' : 'had errors'}`, allOk ? 'success' : 'error');
         }
 
-    } else if (result.type === 'no_action') {
-        addLogEntry('system', {}, { message: result.message }, 'error', 0);
-        showToast(result.message, 'error');
-
-    } else if (result.type === 'error') {
-        addLogEntry('system', {}, { message: result.message }, 'error', 0);
-        showToast(result.message, 'error');
+    } else if (result.type === 'no_action' || result.type === 'error') {
+        addChatMsg('error', result.message);
+        addLogLine('error', 'no_action', result.message);
     }
 }
 
 // ============================================================
-// UI Rendering
+// Chat Messages
 // ============================================================
+function addChatMsg(type, text, timeMs) {
+    const div = document.createElement('div');
+    const cls = type === 'error' ? 'chat-msg error-msg' : `chat-msg ${type}`;
+    div.className = cls;
 
-function clearEmptyState() {
-    const empty = execLog.querySelector('.empty-state');
-    if (empty) empty.remove();
+    const prefix = type === 'user' ? 'You' : type === 'error' ? 'Error' : 'System';
+    const timeStr = timeMs ? `<span class="chat-time">${Math.round(timeMs)}ms</span>` : '';
+
+    div.innerHTML = `<span class="chat-prefix">${prefix}</span>${escapeHtml(text)}${timeStr}`;
+    chatMessages.appendChild(div);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-function addTranscript(text, timeMs) {
-    clearEmptyState();
+// ============================================================
+// Bottom Logs
+// ============================================================
+function addLogLine(status, tool, detail) {
     const div = document.createElement('div');
-    div.className = 'transcript-entry';
+    div.className = 'log-line';
+
+    const iconMap = { success: '\u2713', error: '\u2717', running: '\u25CB', info: '\u2022' };
     div.innerHTML = `
-        <div class="label">You said${timeMs > 0 ? ` (${Math.round(timeMs)}ms)` : ''}</div>
-        <div class="text">${escapeHtml(text)}</div>
+        <span class="log-timestamp">${now()}</span>
+        <span class="log-icon ${status}">${iconMap[status] || '\u2022'}</span>
+        <span class="log-content"><strong>${escapeHtml(tool)}</strong> ${escapeHtml(detail || '')}</span>
     `;
-    execLog.appendChild(div);
-    execLog.scrollTop = execLog.scrollHeight;
+    bottomLogs.appendChild(div);
+    bottomLogs.scrollTop = bottomLogs.scrollHeight;
 }
 
-function addRoutineHeader(text) {
-    clearEmptyState();
-    const div = document.createElement('div');
-    div.className = 'routine-header';
-    div.textContent = text;
-    execLog.appendChild(div);
-    execLog.scrollTop = execLog.scrollHeight;
+// ============================================================
+// Routine Flow Canvas
+// ============================================================
+function renderFlow(routine) {
+    if (!routine) {
+        flowContainer.innerHTML = '';
+        flowContainer.appendChild(canvasEmpty);
+        canvasEmpty.style.display = '';
+        return;
+    }
+
+    canvasEmpty.style.display = 'none';
+    flowContainer.innerHTML = '';
+
+    const chain = document.createElement('div');
+    chain.className = 'flow-chain';
+
+    // Start node
+    const start = document.createElement('div');
+    start.className = 'flow-start';
+    start.innerHTML = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+    chain.appendChild(start);
+
+    for (let i = 0; i < routine.steps.length; i++) {
+        const step = routine.steps[i];
+        const vis = getToolVisual(step.tool);
+
+        // Connector
+        const conn = document.createElement('div');
+        conn.className = 'flow-connector';
+        conn.id = `conn-${i}`;
+        chain.appendChild(conn);
+
+        // Node
+        const node = document.createElement('div');
+        node.className = 'flow-node';
+        node.id = `node-${i}`;
+        node.draggable = true;
+        node.dataset.index = i;
+
+        const argsHtml = Object.entries(step.args || {})
+            .map(([k, v]) => `<span class="arg-key">${k}:</span> <span class="arg-val">${escapeHtml(String(v))}</span>`)
+            .join('<br>');
+
+        node.innerHTML = `
+            <div class="flow-node-header">
+                <div class="flow-node-icon ${vis.cls}">${vis.icon}</div>
+                <div>
+                    <div class="flow-node-title">${escapeHtml(step.tool)}</div>
+                    <div class="flow-node-step">Step ${i + 1}</div>
+                </div>
+            </div>
+            <div class="flow-node-args">${argsHtml}</div>
+        `;
+
+        // Drag/drop reorder
+        node.addEventListener('dragstart', e => {
+            e.dataTransfer.setData('text/plain', i.toString());
+            node.style.opacity = '0.5';
+        });
+        node.addEventListener('dragend', () => { node.style.opacity = '1'; });
+        node.addEventListener('dragover', e => e.preventDefault());
+        node.addEventListener('drop', e => {
+            e.preventDefault();
+            const from = parseInt(e.dataTransfer.getData('text/plain'));
+            const to = parseInt(node.dataset.index);
+            if (from !== to) reorderSteps(routine, from, to);
+        });
+
+        chain.appendChild(node);
+    }
+
+    flowContainer.appendChild(chain);
 }
 
-function addLogEntry(tool, args, result, status, timeMs) {
-    clearEmptyState();
-    const div = document.createElement('div');
-    div.className = `log-entry ${status}`;
-
-    const argsStr = Object.entries(args || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
-    const resultStr = result ? JSON.stringify(result, null, 2) : '';
-
-    div.innerHTML = `
-        <div class="entry-header">
-            <span class="entry-tool">${escapeHtml(tool)}</span>
-            <span class="entry-status ${status}">
-                ${status === 'running' ? '<span class="spinner"></span> ' : ''}${status}
-            </span>
-        </div>
-        ${argsStr ? `<div class="entry-args">${escapeHtml(argsStr)}</div>` : ''}
-        ${resultStr ? `<div class="entry-result">${escapeHtml(resultStr)}</div>` : ''}
-        ${timeMs > 0 ? `<div class="entry-time">${Math.round(timeMs)}ms</div>` : ''}
-    `;
-    execLog.appendChild(div);
-    execLog.scrollTop = execLog.scrollHeight;
-    return div;
-}
-
-function showTiming(transcribeMs, inferenceMs, totalMs) {
-    const parts = [];
-    if (transcribeMs > 0) parts.push(`transcribe: ${Math.round(transcribeMs)}ms`);
-    if (inferenceMs > 0) parts.push(`inference: ${Math.round(inferenceMs)}ms`);
-    parts.push(`total: ${Math.round(totalMs)}ms`);
-    timingDisplay.textContent = parts.join(' | ');
-}
-
-// ---- Routine progress callback (called from Python) ----
+// Progress callback from Python during routine execution
 window.onRoutineProgress = function(step, total, status, result) {
-    if (step === 1 && status === 'running') {
-        clearEmptyState();
-    }
+    const nodeIdx = step - 1;
+    const node = document.getElementById(`node-${nodeIdx}`);
+    const conn = document.getElementById(`conn-${nodeIdx}`);
 
     if (status === 'running') {
-        const div = addLogEntry(
-            result ? result.tool : `Step ${step}`,
-            result ? result.args : {},
-            null,
-            'running',
-            0
-        );
-        div.id = `step-${step}`;
+        if (node) node.className = 'flow-node running';
+        addLogLine('running', result ? result.tool : `Step ${step}`, 'executing...');
     } else {
-        const existing = document.getElementById(`step-${step}`);
-        if (existing) {
-            existing.remove();
-        }
+        if (node) node.className = `flow-node ${status}`;
+        if (conn) conn.className = 'flow-connector active';
         if (result) {
-            addLogEntry(
-                result.tool,
-                result.args,
-                result.result || { error: result.error },
-                result.status,
-                result.time_ms
-            );
+            const detail = result.status === 'success'
+                ? formatArgs(result.result || {})
+                : (result.error || 'failed');
+            addLogLine(result.status, result.tool, detail);
         }
     }
 };
 
 // ============================================================
-// Routine Sidebar
+// Sidebar
 // ============================================================
-
 async function loadRoutines() {
     const routines = await pywebview.api.get_routines();
     routineList.innerHTML = '';
 
     for (const r of routines) {
         const div = document.createElement('div');
-        div.className = 'routine-item';
+        div.className = 'routine-item' + (activeRoutine && activeRoutine.name === r.name ? ' active' : '');
         div.innerHTML = `
             <div class="routine-name">${escapeHtml(r.name)}</div>
             <div class="routine-meta">${r.steps.length} step${r.steps.length !== 1 ? 's' : ''}</div>
             <div class="routine-actions">
                 <button class="btn-run" onclick="event.stopPropagation(); runRoutine('${escapeAttr(r.name)}')">Run</button>
-                <button class="btn-delete" onclick="event.stopPropagation(); deleteRoutine('${escapeAttr(r.name)}')">Delete</button>
+                <button class="btn-delete" onclick="event.stopPropagation(); deleteRoutine('${escapeAttr(r.name)}')">Del</button>
             </div>
         `;
-        div.addEventListener('click', () => showRoutineDetail(r));
+        div.addEventListener('click', () => {
+            activeRoutine = r;
+            renderFlow(r);
+            loadRoutines(); // re-render active state
+        });
         routineList.appendChild(div);
     }
 }
 
-function showRoutineDetail(routine) {
-    clearEmptyState();
-    execLog.innerHTML = '';
-    addRoutineHeader('Routine: ' + routine.name);
+async function runRoutine(name) {
+    // Select it first
+    const routines = await pywebview.api.get_routines();
+    activeRoutine = routines.find(r => r.name === name) || activeRoutine;
+    if (activeRoutine) renderFlow(activeRoutine);
+    loadRoutines();
 
-    for (let i = 0; i < routine.steps.length; i++) {
-        const step = routine.steps[i];
-        const card = document.createElement('div');
-        card.className = 'step-card';
-        card.draggable = true;
-        card.dataset.index = i;
+    addChatMsg('system', `Running routine "${name}"...`);
+    addLogLine('info', 'routine', `started: ${name}`);
 
-        const argsStr = Object.entries(step.args || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
-        card.innerHTML = `
-            <div class="step-num">${i + 1}</div>
-            <div class="step-info">
-                <div class="step-tool">${escapeHtml(step.tool)}</div>
-                <div class="step-args">${escapeHtml(argsStr)}</div>
-            </div>
-        `;
+    const result = await pywebview.api.process_command('run ' + name);
+    handleResult(result, 0, 0);
+}
 
-        card.addEventListener('dragstart', (e) => {
-            card.classList.add('dragging');
-            e.dataTransfer.setData('text/plain', i.toString());
-        });
-        card.addEventListener('dragend', () => card.classList.remove('dragging'));
-        card.addEventListener('dragover', (e) => e.preventDefault());
-        card.addEventListener('drop', (e) => {
-            e.preventDefault();
-            const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
-            const toIdx = parseInt(card.dataset.index);
-            if (fromIdx !== toIdx) {
-                reorderSteps(routine, fromIdx, toIdx);
-            }
-        });
-
-        execLog.appendChild(card);
+async function deleteRoutine(name) {
+    await pywebview.api.delete_routine(name);
+    showToast(`Deleted "${name}"`, 'info');
+    if (activeRoutine && activeRoutine.name === name) {
+        activeRoutine = null;
+        renderFlow(null);
     }
+    loadRoutines();
 }
 
 async function reorderSteps(routine, fromIdx, toIdx) {
@@ -281,30 +323,24 @@ async function reorderSteps(routine, fromIdx, toIdx) {
     steps.splice(toIdx, 0, moved);
     routine.steps = steps;
     await pywebview.api.update_routine_steps(routine.name, JSON.stringify(steps));
-    showRoutineDetail(routine);
+    renderFlow(routine);
     showToast('Steps reordered', 'info');
 }
 
-async function runRoutine(name) {
-    clearEmptyState();
-    execLog.innerHTML = '';
-    addRoutineHeader('Running: ' + name);
-
-    const result = await pywebview.api.process_command('run ' + name);
-    handleResult(result, 0, 0);
-}
-
-async function deleteRoutine(name) {
-    await pywebview.api.delete_routine(name);
-    showToast(`Deleted routine "${name}"`, 'info');
-    loadRoutines();
-    execLog.innerHTML = '<div class="empty-state"><div class="empty-icon">&#127908;</div><p>Tap the mic and speak a command</p></div>';
+// ============================================================
+// Timing
+// ============================================================
+function showTiming(transcribeMs, inferenceMs, totalMs) {
+    const parts = [];
+    if (transcribeMs > 0) parts.push(`STT ${Math.round(transcribeMs)}ms`);
+    if (inferenceMs > 0) parts.push(`LLM ${Math.round(inferenceMs)}ms`);
+    parts.push(`Total ${Math.round(totalMs)}ms`);
+    timingDisplay.textContent = parts.join(' \u2022 ');
 }
 
 // ============================================================
-// Toast Notifications
+// Toast
 // ============================================================
-
 function showToast(message, type) {
     const container = document.getElementById('toast-container');
     const toast = document.createElement('div');
@@ -317,7 +353,6 @@ function showToast(message, type) {
 // ============================================================
 // Utilities
 // ============================================================
-
 function escapeHtml(str) {
     if (typeof str !== 'string') return String(str);
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -328,37 +363,32 @@ function escapeAttr(str) {
     return str.replace(/'/g, "\\'").replace(/"/g, '\\"');
 }
 
+function formatArgs(obj) {
+    return Object.entries(obj || {}).map(([k, v]) => `${k}=${v}`).join(', ');
+}
+
 // ============================================================
 // Event Listeners
 // ============================================================
-
 micBtn.addEventListener('click', () => {
-    if (isRecording) {
-        stopRecording();
-    } else {
-        startRecording();
-    }
+    if (isRecording) stopRecording();
+    else startRecording();
 });
 
 sendBtn.addEventListener('click', () => {
     const text = textInput.value.trim();
-    if (text) {
-        textInput.value = '';
-        processTextCommand(text);
-    }
+    if (text) { textInput.value = ''; processTextCommand(text); }
 });
 
-textInput.addEventListener('keydown', (e) => {
+textInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
         const text = textInput.value.trim();
-        if (text) {
-            textInput.value = '';
-            processTextCommand(text);
-        }
+        if (text) { textInput.value = ''; processTextCommand(text); }
     }
 });
 
 // ---- Init ----
 window.addEventListener('pywebviewready', () => {
     loadRoutines();
+    addLogLine('info', 'system', 'Voice Routines ready');
 });
