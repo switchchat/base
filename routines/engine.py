@@ -6,19 +6,11 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 DEMO_ROUTINES = [
     {
-        "name": "morning prep",
+        "name": "morning routine",
         "steps": [
-            {"tool": "get_weather", "args": {"location": "San Francisco"}},
-            {"tool": "play_music", "args": {"song": "morning jazz playlist"}},
-            {"tool": "set_timer", "args": {"minutes": 15}},
-        ],
-    },
-    {
-        "name": "evening wind-down",
-        "steps": [
-            {"tool": "play_music", "args": {"song": "lo-fi chill beats"}},
-            {"tool": "set_alarm", "args": {"hour": 7, "minute": 0}},
-            {"tool": "create_reminder", "args": {"title": "prepare lunch", "time": "7:30 AM"}},
+            {"tool": "get_weather", "args": {"location": "Singapore"}},
+            {"tool": "create_reminder", "args": {"title": "pack umbrella", "time": "8:00 AM"}, "condition": "if rainy"},
+            {"tool": "play_music", "args": {"song": "Complicated Mac Miller"}},
         ],
     },
 ]
@@ -86,6 +78,9 @@ class RoutineEngine:
         for i, step in enumerate(steps):
             if progress_callback:
                 progress_callback(i + 1, len(steps), "running", None)
+            # Demo pacing — small delay between steps so the UI feels deliberate
+            if i > 0:
+                time.sleep(1.5)
             start = time.time()
             try:
                 result = execute_fn(step["tool"], step["args"])

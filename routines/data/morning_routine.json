@@ -1,0 +1,25 @@
+{
+  "name": "morning routine",
+  "steps": [
+    {
+      "tool": "play_music",
+      "args": {
+        "song": "Complicated Mac Miller"
+      }
+    },
+    {
+      "tool": "get_weather",
+      "args": {
+        "location": "Singapore"
+      }
+    },
+    {
+      "tool": "create_reminder",
+      "args": {
+        "title": "pack umbrella",
+        "time": "8:00 AM"
+      },
+      "condition": "if rainy"
+    }
+  ]
+}

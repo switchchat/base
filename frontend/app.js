@@ -21,22 +21,21 @@ const execLog = document.getElementById('execution-log');
 
 // Tool icons
 const TOOL_ICONS = {
-    get_weather: { icon: '\u2601', cls: 'weather' },
-    play_music: { icon: '\u266B', cls: 'music' },
-    set_timer: { icon: '\u23F1', cls: 'timer' },
-    set_alarm: { icon: '\u23F0', cls: 'alarm' },
-    send_message: { icon: '\u2709', cls: 'message' },
-    create_reminder: { icon: '\uD83D\uDD14', cls: 'reminder' },
-    search_contacts: { icon: '\uD83D\uDC64', cls: 'contact' },
+    get_weather:     { icon: '\u2601\uFE0F', cls: 'weather',  label: 'Weather' },
+    play_music:      { icon: '\uD83C\uDFB5', cls: 'music',    label: 'Music' },
+    set_timer:       { icon: '\u23F1\uFE0F', cls: 'timer',    label: 'Timer' },
+    set_alarm:       { icon: '\u23F0',        cls: 'alarm',    label: 'Alarm' },
+    send_message:    { icon: '\uD83D\uDCE8', cls: 'message',  label: 'Message' },
+    create_reminder: { icon: '\uD83D\uDD14', cls: 'reminder', label: 'Reminder' },
+    search_contacts: { icon: '\uD83D\uDC64', cls: 'contact',  label: 'Contacts' },
 };
 
 function getToolVisual(toolName) {
-    return TOOL_ICONS[toolName] || { icon: '\u2699', cls: 'default' };
+    return TOOL_ICONS[toolName] || { icon: '\u2699\uFE0F', cls: 'default', label: toolName };
 }
 
 function now() {
-    const d = new Date();
-    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 // ============================================================
@@ -74,14 +73,18 @@ async function stopRecording() {
     const txResult = await pywebview.api.stop_recording();
 
     if (txResult.error) {
+        removeLast('Processing');
+        removeLast('Transcribing');
         addChatMsg('error', 'Transcription error: ' + txResult.error);
         return;
     }
     if (!txResult.text) {
+        removeLast('Transcribing');
         addChatMsg('error', 'No speech detected');
         return;
     }
 
+    removeLast('Transcribing');
     addChatMsg('user', txResult.text, txResult.time_ms);
     addChatMsg('system', 'Processing...');
 
@@ -105,52 +108,76 @@ async function processTextCommand(text) {
 }
 
 function handleResult(result, transcribeMs, totalMs) {
-    // Remove "Processing..." message
-    const msgs = chatMessages.querySelectorAll('.chat-msg.system');
-    const last = msgs[msgs.length - 1];
-    if (last && last.textContent.includes('Processing')) last.remove();
+    removeLast('Processing');
 
     if (result.type === 'direct') {
         for (const r of result.results) {
-            addChatMsg('system', `${r.tool}(${formatArgs(r.args)})`, r.time_ms);
-            addLogLine('success', r.tool, formatArgs(r.args));
+            const summary = r.result.summary || `${r.tool} completed`;
+            addChatMsg('result', summary, r.time_ms, r.tool);
+            addLogLine('success', r.tool, summary);
         }
         showTiming(transcribeMs, result.inference_ms, totalMs);
-        showToast('Command executed', 'success');
 
     } else if (result.type === 'routine_created') {
-        addChatMsg('system', result.message);
-        addLogLine('success', 'routine_created', result.routine.name);
-        showToast(result.message, 'success');
+        addChatMsg('result', result.message, null, 'routine');
+        addLogLine('success', 'created', result.routine.name);
         loadRoutines();
+        // Auto-select the new routine
+        activeRoutine = result.routine;
+        renderFlow(result.routine);
 
     } else if (result.type === 'routine_executed') {
         if (result.result && result.result.results) {
             const allOk = result.result.results.every(r => r.status === 'success');
-            addChatMsg('system', `Routine "${result.result.routine}" ${allOk ? 'completed' : 'finished with errors'}`);
-            showToast(`Routine ${allOk ? 'completed' : 'had errors'}`, allOk ? 'success' : 'error');
+            // Show each step result in chat
+            for (const r of result.result.results) {
+                const summary = r.result ? (r.result.summary || JSON.stringify(r.result)) : r.error;
+                addChatMsg('result', summary, r.time_ms, r.tool);
+            }
+            addChatMsg('system', allOk
+                ? `Routine "${result.result.routine}" completed successfully`
+                : `Routine "${result.result.routine}" finished with errors`);
         }
 
     } else if (result.type === 'no_action' || result.type === 'error') {
         addChatMsg('error', result.message);
-        addLogLine('error', 'no_action', result.message);
+        addLogLine('error', 'error', result.message);
     }
 }
 
 // ============================================================
 // Chat Messages
 // ============================================================
-function addChatMsg(type, text, timeMs) {
+function addChatMsg(type, text, timeMs, toolName) {
     const div = document.createElement('div');
-    const cls = type === 'error' ? 'chat-msg error-msg' : `chat-msg ${type}`;
-    div.className = cls;
+    div.className = `chat-msg ${type}`;
 
-    const prefix = type === 'user' ? 'You' : type === 'error' ? 'Error' : 'System';
     const timeStr = timeMs ? `<span class="chat-time">${Math.round(timeMs)}ms</span>` : '';
 
-    div.innerHTML = `<span class="chat-prefix">${prefix}</span>${escapeHtml(text)}${timeStr}`;
+    if (type === 'user') {
+        div.innerHTML = `<span class="chat-prefix">\u25B6</span>${escapeHtml(text)}${timeStr}`;
+    } else if (type === 'result') {
+        const vis = toolName ? getToolVisual(toolName) : null;
+        const icon = vis ? `<span class="chat-tool-icon">${vis.icon}</span>` : '';
+        div.innerHTML = `${icon}<span class="chat-result-text">${escapeHtml(text)}</span>${timeStr}`;
+    } else if (type === 'error') {
+        div.innerHTML = `<span class="chat-prefix chat-error-prefix">\u2717</span>${escapeHtml(text)}`;
+    } else {
+        div.innerHTML = `<span class="chat-prefix chat-sys-prefix">\u2022</span><span class="chat-sys-text">${escapeHtml(text)}</span>`;
+    }
+
     chatMessages.appendChild(div);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function removeLast(containing) {
+    const msgs = chatMessages.querySelectorAll('.chat-msg');
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].textContent.includes(containing)) {
+            msgs[i].remove();
+            return;
+        }
+    }
 }
 
 // ============================================================
@@ -218,11 +245,13 @@ function renderFlow(routine) {
             <div class="flow-node-header">
                 <div class="flow-node-icon ${vis.cls}">${vis.icon}</div>
                 <div>
-                    <div class="flow-node-title">${escapeHtml(step.tool)}</div>
+                    <div class="flow-node-title">${escapeHtml(vis.label)}</div>
                     <div class="flow-node-step">Step ${i + 1}</div>
                 </div>
             </div>
+            ${step.condition ? `<div class="flow-node-condition">◆ ${escapeHtml(step.condition)}</div>` : ''}
             <div class="flow-node-args">${argsHtml}</div>
+            <div class="flow-node-result" id="result-${i}"></div>
         `;
 
         // Drag/drop reorder
@@ -250,17 +279,22 @@ window.onRoutineProgress = function(step, total, status, result) {
     const nodeIdx = step - 1;
     const node = document.getElementById(`node-${nodeIdx}`);
     const conn = document.getElementById(`conn-${nodeIdx}`);
+    const resultDiv = document.getElementById(`result-${nodeIdx}`);
 
     if (status === 'running') {
         if (node) node.className = 'flow-node running';
-        addLogLine('running', result ? result.tool : `Step ${step}`, 'executing...');
+        if (resultDiv) resultDiv.innerHTML = '<span class="spinner"></span> Running...';
+        addLogLine('running', result ? result.tool : `step ${step}`, 'executing...');
     } else {
         if (node) node.className = `flow-node ${status}`;
         if (conn) conn.className = 'flow-connector active';
+        if (result && resultDiv) {
+            const summary = result.result ? (result.result.summary || JSON.stringify(result.result)) : result.error;
+            const timeStr = result.time_ms ? ` <span class="node-time">${Math.round(result.time_ms)}ms</span>` : '';
+            resultDiv.innerHTML = `<span class="node-result-text">${escapeHtml(summary)}</span>${timeStr}`;
+        }
         if (result) {
-            const detail = result.status === 'success'
-                ? formatArgs(result.result || {})
-                : (result.error || 'failed');
+            const detail = result.result ? (result.result.summary || '') : (result.error || 'failed');
             addLogLine(result.status, result.tool, detail);
         }
     }
@@ -287,23 +321,22 @@ async function loadRoutines() {
         div.addEventListener('click', () => {
             activeRoutine = r;
             renderFlow(r);
-            loadRoutines(); // re-render active state
+            loadRoutines();
         });
         routineList.appendChild(div);
     }
 }
 
 async function runRoutine(name) {
-    // Select it first
     const routines = await pywebview.api.get_routines();
     activeRoutine = routines.find(r => r.name === name) || activeRoutine;
     if (activeRoutine) renderFlow(activeRoutine);
     loadRoutines();
 
-    addChatMsg('system', `Running routine "${name}"...`);
+    addChatMsg('system', `Running "${name}"...`);
     addLogLine('info', 'routine', `started: ${name}`);
 
-    const result = await pywebview.api.process_command('run ' + name);
+    const result = await pywebview.api.run_routine(name);
     handleResult(result, 0, 0);
 }
 
