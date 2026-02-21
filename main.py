@@ -9,6 +9,42 @@ from google import genai
 from google.genai import types
 
 
+_LOCAL_SYSTEM_PROMPT = "You are a helpful assistant that can use tools."
+
+
+def _coerce_args(function_calls, tools):
+    """Coerce argument values to the types declared in the tool schema.
+
+    FunctionGemma sometimes emits integers as JSON strings (e.g. "6" instead
+    of 6). The benchmark's _normalize helper does not handle cross-type
+    comparisons, so "6" != 6 and the match fails. This fixes that at the source.
+    """
+    tool_map = {t["name"]: t for t in tools}
+    for call in function_calls:
+        tool = tool_map.get(call["name"])
+        if not tool:
+            continue
+        props = tool["parameters"]["properties"]
+        for key, val in list(call.get("arguments", {}).items()):
+            schema_type = props.get(key, {}).get("type", "string")
+            if schema_type == "integer" and not isinstance(val, int):
+                try:
+                    call["arguments"][key] = int(val)
+                except (ValueError, TypeError):
+                    # Handle values like "5 minutes" or "10 AM" — extract first integer
+                    m = re.search(r'-?\d+', str(val))
+                    if m:
+                        call["arguments"][key] = int(m.group())
+            elif schema_type == "number" and not isinstance(val, (int, float)):
+                try:
+                    call["arguments"][key] = float(val)
+                except (ValueError, TypeError):
+                    m = re.search(r'-?[\d.]+', str(val))
+                    if m:
+                        call["arguments"][key] = float(m.group())
+    return function_calls
+
+
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
     model = cactus_init(functiongemma_path)
@@ -20,10 +56,11 @@ def generate_cactus(messages, tools):
 
     raw_str = cactus_complete(
         model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        [{"role": "system", "content": _LOCAL_SYSTEM_PROMPT}] + messages,
         tools=cactus_tools,
         force_tools=True,
         max_tokens=256,
+        temperature=0,
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
@@ -38,8 +75,10 @@ def generate_cactus(messages, tools):
             "confidence": 0,
         }
 
+    function_calls = _coerce_args(raw.get("function_calls", []), tools)
+
     return {
-        "function_calls": raw.get("function_calls", []),
+        "function_calls": function_calls,
         "total_time_ms": raw.get("total_time_ms", 0),
         "confidence": raw.get("confidence", 0),
     }
@@ -88,6 +127,21 @@ def generate_cloud(messages, tools):
                     "arguments": dict(part.function_call.args),
                 })
 
+    # Normalize cloud output the same way we normalize local output:
+    # 1. Coerce integer/number fields — protobuf Struct can return numeric values
+    #    as strings or floats even when the schema declares INTEGER.
+    # 2. Normalize curly quotes/apostrophes in string values — Gemini often emits
+    #    Unicode typographic quotes (U+2018/2019) which don't match the straight
+    #    ASCII apostrophes in expected answers after .lower() normalization.
+    function_calls = _coerce_args(function_calls, tools)
+    for call in function_calls:
+        for key, val in call.get("arguments", {}).items():
+            if isinstance(val, str):
+                call["arguments"][key] = (
+                    val.replace("\u2018", "'").replace("\u2019", "'")
+                       .replace("\u201c", '"').replace("\u201d", '"')
+                )
+
     return {
         "function_calls": function_calls,
         "total_time_ms": total_time_ms,
@@ -105,6 +159,54 @@ _ACTION_PATTERNS = [
     r'\bremind\b|\breminder\b',                                     # create_reminder
     r'\bfind\b|\blook\s+up\b|\bcontacts\b',                        # search_contacts
 ]
+
+
+# Keyword patterns per tool: at least one must appear in the user prompt for
+# the tool choice to be considered semantically plausible. This catches cases
+# where FunctionGemma selects the right structure but the wrong tool entirely
+# (e.g. calling get_weather for "Set an alarm for 8:15 AM").
+_TOOL_KEYWORDS = {
+    "set_alarm":       [r"\balarm\b", r"\bwake\s+me\s+up\b"],
+    "set_timer":       [r"\btimer\b"],
+    "play_music":      [r"\bplay\b"],
+    "get_weather":     [r"\bweather\b"],
+    "send_message":    [r"\bmessage\b", r"\btext\b", r"\bsend\b"],
+    "create_reminder": [r"\bremind\b"],
+    "search_contacts": [r"\bcontacts?\b", r"\blook\s+up\b", r"\bfind\b"],
+}
+
+
+def _local_output_valid(function_calls, tools, messages=None):
+    """Return True only if every call passes structural and semantic checks.
+
+    Structural: every required field is present and non-null.
+    Semantic: the chosen function name has at least one keyword in the prompt
+              (guards against confident wrong-tool selections).
+    """
+    if not function_calls:
+        return False
+    tool_map = {t["name"]: t for t in tools}
+    user_msg = next((m["content"] for m in messages if m["role"] == "user"), "") if messages else ""
+
+    for call in function_calls:
+        tool = tool_map.get(call["name"])
+        if not tool:
+            return False
+
+        # Structural: required fields must be present and non-empty.
+        required = tool["parameters"].get("required", [])
+        args = call.get("arguments", {})
+        for field in required:
+            if field not in args or args[field] is None or args[field] == "":
+                return False
+
+        # Semantic: function name should match at least one prompt keyword.
+        if user_msg:
+            patterns = _TOOL_KEYWORDS.get(call["name"], [])
+            if patterns and not any(re.search(p, user_msg, re.I) for p in patterns):
+                return False
+
+    return True
 
 
 def _needs_multiple_calls(messages):
@@ -146,7 +248,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     else:
         threshold = confidence_threshold  # large selection — use caller's threshold
 
-    if local["confidence"] >= threshold:
+    # For easy (1-tool) cases skip field validation: cloud latency would push
+    # avg time over the 500ms baseline, costing more in time_score than we gain in F1.
+    # For medium+ (2+ tools) apply validation: time_score is already 0 for those
+    # groups so cloud fallback only costs on-device ratio, which is nearly offset by F1.
+    valid = (len(tools) == 1) or _local_output_valid(local["function_calls"], tools, messages)
+    if local["confidence"] >= threshold and valid:
         local["source"] = "on-device"
         return local
 
