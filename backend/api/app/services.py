@@ -1,5 +1,15 @@
 import hashlib
+import uuid
 from typing import List
+from datetime import datetime, timezone
+
+
+_session_state = {
+    "active": False,
+    "session_id": None,
+    "started_at": None,
+    "called_functions": [],
+}
 
 
 def predict(text: str) -> str:
@@ -34,3 +44,67 @@ def embed_default(dim: int = 64) -> List[float]:
     import os
     default_text = os.getenv("DEFAULT_EMBED_TEXT", "button-press")
     return embed(default_text, dim=dim)
+
+
+def start_session() -> dict:
+    if _session_state["active"]:
+        return {
+            "message": "Session is already active.",
+            "session_id": _session_state["session_id"],
+            "active": True,
+        }
+
+    session_id = str(uuid.uuid4())
+    _session_state["active"] = True
+    _session_state["session_id"] = session_id
+    _session_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    _session_state["called_functions"] = ["/session/start"]
+
+    return {
+        "message": "Session started.",
+        "session_id": session_id,
+        "active": True,
+    }
+
+
+def end_session() -> dict:
+    if not _session_state["active"]:
+        return {
+            "message": "Session is already inactive.",
+            "session_id": None,
+            "active": False,
+            "called_functions": [],
+        }
+
+    _session_state["called_functions"].append("/session/end")
+
+    result = {
+        "message": "Session ended.",
+        "session_id": _session_state["session_id"],
+        "active": False,
+        "called_functions": list(_session_state["called_functions"]),
+    }
+
+    _session_state["active"] = False
+    _session_state["session_id"] = None
+    _session_state["started_at"] = None
+    _session_state["called_functions"] = []
+
+    return result
+
+
+def is_session_active() -> bool:
+    return bool(_session_state["active"])
+
+
+def record_function_call(function_name: str) -> None:
+    if _session_state["active"]:
+        _session_state["called_functions"].append(function_name)
+
+
+def get_session_status() -> dict:
+    return {
+        "session_id": _session_state["session_id"],
+        "active": bool(_session_state["active"]),
+        "called_functions": list(_session_state["called_functions"]),
+    }
