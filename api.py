@@ -48,7 +48,6 @@ class Api:
         if self._recording:
             return {"status": "already_recording"}
         self._recorded_frames = []
-        self._recording = True
 
         def callback(indata, frames, time_info, status):
             if self._recording:
@@ -61,6 +60,7 @@ class Api:
             callback=callback,
         )
         self._stream.start()
+        self._recording = True
         return {"status": "recording"}
 
     def stop_recording(self):
@@ -106,6 +106,7 @@ class Api:
     # Voice transcription (base64 fallback — kept for compatibility)
     # ------------------------------------------------------------------
     def transcribe_base64(self, audio_b64):
+        tmp_path = None
         try:
             audio_bytes = base64.b64decode(audio_b64)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -116,12 +117,14 @@ class Api:
                 whisper = self._get_whisper()
                 raw = cactus_transcribe(whisper, tmp_path, prompt=WHISPER_PROMPT)
             elapsed = (time.time() - start) * 1000
-            os.unlink(tmp_path)
             parsed = json.loads(raw) if isinstance(raw, str) else raw
             text = parsed.get("response", "") if isinstance(parsed, dict) else str(parsed)
             return {"text": text.strip(), "time_ms": round(elapsed, 1)}
         except Exception as e:
             return {"error": str(e), "text": "", "time_ms": 0}
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     # ------------------------------------------------------------------
     # Command processing — the core intent router

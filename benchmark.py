@@ -457,9 +457,9 @@ def compute_total_score(results):
     Compute a total score from 0-100% as a weighted sum across difficulty levels.
 
     Components (per difficulty level):
-      - F1 score (50%): accuracy of tool calls
-      - Time score (25%): faster is better, capped at 500ms baseline
-      - On-device ratio (25%): higher on-device usage is better
+      - F1 score (34%): accuracy of tool calls
+      - Time score (33%): faster is better, capped at 500ms baseline
+      - On-device ratio (33%): higher on-device usage is better
 
     Difficulty weights:
       - easy: 20%
